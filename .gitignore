@@ -1,0 +1,16 @@
+# Standard ROS ignore
+build/
+devel/
+logs/
+.catkin_workspace
+*.pyc
+*.egg-info
+__pycache__/
+bin/
+lib/
+msg_gen/
+srv_gen/
+generated/
+
+.vscode/
+.idea/
