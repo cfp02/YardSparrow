@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TransformStamped, Quaternion
 from sensor_msgs.msg import Imu
+from nav_msgs.msg import Odometry
+from tf2_ros import TransformBroadcaster
 import serial
 import math
 import time
@@ -19,6 +21,12 @@ class YardSparrowDriver(Node):
         self.declare_parameter('baud', 115200)
         self.declare_parameter('wheel_diameter_m', 0.1651) # 6.5 inches
         self.declare_parameter('track_width_m', 0.523) # Distance between wheels (523mm)
+
+        # --- Robot State (Odometry) ---
+        self.x = 0.0
+        self.y = 0.0
+        self.th = 0.0
+        self.last_odom_time = self.get_clock().now()
         
         # --- Internal State ---
         self.target_speed = 0
@@ -63,15 +71,13 @@ class YardSparrowDriver(Node):
         self.create_subscription(Twist, 'cmd_vel', self.cmd_vel_callback, 10)
         self.imu_pub = self.create_publisher(Imu, 'imu/data', 10)
 
+        self.odom_pub = self.create_publisher(Odometry, 'odom', 10)
+        self.tf_broadcaster = TransformBroadcaster(self) # For rviz
+
         # --- Timers ---
-        # 1. Write Loop (50Hz): Sends heartbeat commands to wheels
-        self.create_timer(0.02, self.write_serial_loop) 
-        
-        # 2. Read Loop (50Hz): Reads feedback from Wheels and IMU
-        self.create_timer(0.02, self.read_serial_loop)
-        
-        # 3. Quaternion Monitor (1Hz): Checks if quaternion data is being received
-        self.create_timer(1.0, self.monitor_quaternion_data)
+        self.create_timer(0.02, self.write_serial_loop) # Heartbeat to wheels at 50Hz
+        self.create_timer(0.02, self.read_serial_loop) # Reads feedback from Wheels and IMU at 50Hz
+        self.create_timer(1.0, self.monitor_quaternion_data) # Checks if quaternion data is being received at 1Hz
 
     def send_imu_cmd(self, char_cmd):
         """Helper to send commands to IMU"""
@@ -133,6 +139,10 @@ class YardSparrowDriver(Node):
         
         turn_val = (angular_z * track_width * 6.0) / (math.pi * wheel_dia)
 
+        # Reverse wheels
+        # linear_val = -linear_val
+        turn_val = -turn_val
+
         self.target_speed = int(max(min(linear_val, 1000), -1000))
         self.target_turn = int(max(min(turn_val, 1000), -1000))
 
@@ -164,17 +174,121 @@ class YardSparrowDriver(Node):
                 # --- CASE 1: Wheel Feedback ---
                 # Format: "[W] V:42.0 L:100 R:100 T:30.0"
                 if line.startswith("[W]"):
-                    # For now, just log it. Later odom calculations go here
                     # self.get_logger().info(f"Odom: {line}")
-                    pass
+                    self.calculate_odometry(line)
 
                 # --- CASE 2: IMU Data ---
                 # Format: "[I] qW:0.99 qX:0.01..."
                 elif line.startswith("[I]"):
                     self.parse_imu(line)
+
+                # else: # Print the broken lines for debugging
+                #     self.get_logger().warn(f"Unknown line: {line}")
                     
             except Exception as e:
                 pass
+
+    def calculate_odometry(self, line):
+        """
+        Parses speed feedback and updates robot position (x, y, theta).
+        """
+        try:
+            # DEBUG: Uncomment this to verify data is reaching this function
+            # self.get_logger().info(f"Parsing Odom Line: {line}")
+
+            # Parse Format: "[W] V:42.0V L:100 R:100 T:30.0C"
+            # We strip unit characters 'V' and 'C' to prevent int() conversion errors
+            clean_line = line.replace('V', '').replace('C', '')
+            parts = clean_line[4:].split() # Remove "[W] " and split by spaces
+            
+            speed_l = 0
+            speed_r = 0
+            
+            for p in parts:
+                if p.startswith("L:"):
+                    try:
+                        speed_l = int(p.split(':')[1])
+                    except ValueError:
+                        pass
+                elif p.startswith("R:"):
+                    try:
+                        speed_r = int(p.split(':')[1])
+                    except ValueError:
+                        pass
+
+            # Invert right wheel speed
+            speed_r = -speed_r
+
+            # 1. Convert Raw Speed to m/s
+            # Note: Ensure this divider (60.0 vs 6.0) matches your firmware scaling!
+            wheel_dia = self.get_parameter('wheel_diameter_m').value
+            track_width = self.get_parameter('track_width_m').value
+            
+            v_l = (speed_l * math.pi * wheel_dia) / 60.0
+            v_r = (speed_r * math.pi * wheel_dia) / 60.0
+            
+            # 2. Calculate Robot Velocity
+            v_x = (v_r + v_l) / 2.0  # Linear velocity
+            v_th = (v_r - v_l) / track_width # Angular velocity
+
+            # 3. Integrate over time (dt)
+            current_time = self.get_clock().now()
+            dt = (current_time - self.last_odom_time).nanoseconds / 1e9
+            self.last_odom_time = current_time
+
+            # Handle lag spikes (reset dt if too large)
+            if dt > 1.0: 
+                dt = 0.0
+
+            delta_x = (v_x * math.cos(self.th)) * dt
+            delta_y = (v_x * math.sin(self.th)) * dt
+            delta_th = v_th * dt
+
+            self.x += delta_x
+            self.y += delta_y
+            self.th += delta_th
+
+            # 4. Create Quaternion for Odom
+            q = self.euler_to_quaternion(0, 0, self.th)
+
+            # 5. Publish Transform (odom -> base_link)
+            t = TransformStamped()
+            t.header.stamp = current_time.to_msg()
+            t.header.frame_id = 'odom'
+            t.child_frame_id = 'base_link'
+            t.transform.translation.x = self.x
+            t.transform.translation.y = self.y
+            t.transform.translation.z = 0.0
+            t.transform.rotation = q
+            self.tf_broadcaster.sendTransform(t)
+
+            # 6. Publish Odometry Message
+            odom = Odometry()
+            odom.header.stamp = current_time.to_msg()
+            odom.header.frame_id = 'odom'
+            odom.child_frame_id = 'base_link'
+            
+            # Position
+            odom.pose.pose.position.x = self.x
+            odom.pose.pose.position.y = self.y
+            odom.pose.pose.orientation = q
+            
+            # Velocity
+            odom.twist.twist.linear.x = v_x
+            odom.twist.twist.angular.z = v_th
+            
+            
+            self.odom_pub.publish(odom)
+
+        except Exception as e:
+            self.get_logger().warn(f"Odom Calc Error: {e}")
+
+    def euler_to_quaternion(self, roll, pitch, yaw):
+        qx = math.sin(roll/2) * math.cos(pitch/2) * math.cos(yaw/2) - math.cos(roll/2) * math.sin(pitch/2) * math.sin(yaw/2)
+        qy = math.cos(roll/2) * math.sin(pitch/2) * math.cos(yaw/2) + math.sin(roll/2) * math.cos(pitch/2) * math.sin(yaw/2)
+        qz = math.cos(roll/2) * math.cos(pitch/2) * math.sin(yaw/2) - math.sin(roll/2) * math.sin(pitch/2) * math.cos(yaw/2)
+        qw = math.cos(roll/2) * math.cos(pitch/2) * math.cos(yaw/2) + math.sin(roll/2) * math.sin(pitch/2) * math.sin(yaw/2)
+        return Quaternion(x=qx, y=qy, z=qz, w=qw)
 
     def parse_imu(self, line):
 
