@@ -33,6 +33,15 @@ class YardSparrowDriver(Node):
         self.detection_window_ns = 10.0 * 1e9  # 10 seconds window
         self.detection_threshold = 2  # More than 2 occurrences triggers toggle
         
+        # --- Quaternion Data Monitoring ---
+        self.last_quaternion_time = None  # Timestamp of last received quaternion data
+        self.quaternion_timeout_ns = 2.0 * 1e9  # 2 seconds timeout
+        self.startup_grace_period_ns = 3.0 * 1e9  # 3 seconds to detect if quaternion is already on
+        self.node_start_time = self.get_clock().now()
+        self.quaternion_enable_sent = False  # Track if we've sent the enable command
+        self.last_quaternion_enable_time_ns = 0  # Debounce for quaternion enable (nanoseconds)
+        self.quaternion_enable_debounce_ns = 1.0 * 1e9  # 1 second debounce for quaternion enable
+        
         # --- Setup Serial ---
         port = self.get_parameter('port').value
         baud = self.get_parameter('baud').value
@@ -41,11 +50,10 @@ class YardSparrowDriver(Node):
             self.ser = serial.Serial(port, baud, timeout=0.1)
             self.get_logger().info(f"Connected to Base Station on {port}")
             
-            # Send Initial Config to IMU (Enable Quaternions)
-            # We send '[I] q' to tell the IMU to start streaming Quats
-            time.sleep(2) # Wait for serial to settle
-            self.ser.write(b"[I] q\n")
-            self.get_logger().info("Sent IMU Config: [I] q")
+            # Wait for serial to settle, then check if quaternion data is already coming
+            time.sleep(2)
+            # Don't send quaternion enable immediately, prevents toggling it off if it's already on
+            self.get_logger().info("Serial connected, monitoring for quaternion data...")
             
         except serial.SerialException as e:
             self.get_logger().error(f"Failed to connect to serial: {e}")
@@ -61,6 +69,9 @@ class YardSparrowDriver(Node):
         
         # 2. Read Loop (50Hz): Reads feedback from Wheels and IMU
         self.create_timer(0.02, self.read_serial_loop)
+        
+        # 3. Quaternion Monitor (1Hz): Checks if quaternion data is being received
+        self.create_timer(1.0, self.monitor_quaternion_data)
 
     def send_imu_cmd(self, char_cmd):
         """Helper to send commands to IMU"""
@@ -199,13 +210,67 @@ class YardSparrowDriver(Node):
                 # Publish
                 self.imu_pub.publish(imu_msg)
                 
+                # Update quaternion reception timestamp
+                self.last_quaternion_time = self.get_clock().now()
+                
             except ValueError:
                 pass
 
         # Track lines that match known prefixes but aren't quaternion data
         toggle_cmd = get_toggle_command(raw)
         if toggle_cmd is not None and toggle_cmd != 'q':
+            self.get_logger().info(f"{raw}")
             self.handle_extraneous_imu_output(toggle_cmd)
+    
+    def monitor_quaternion_data(self):
+        """
+        Monitors quaternion data reception and automatically re-enables it if it stops.
+        Handles startup case where quaternion might already be enabled.
+        """
+        if not self.ser:
+            return
+        
+        now = self.get_clock().now()
+        now_ns = now.nanoseconds
+        time_since_start = (now - self.node_start_time).nanoseconds
+        
+        # During startup grace period, check if quaternion data is already coming
+        if time_since_start < self.startup_grace_period_ns:
+            if self.last_quaternion_time is not None:
+                # Quaternion data is already coming, don't send enable command
+                self.get_logger().info("Quaternion data detected during startup, assuming already enabled")
+                self.quaternion_enable_sent = True  # Mark as sent to prevent toggling
+            elif not self.quaternion_enable_sent:
+                # No quaternion data yet, send enable command after a short delay
+                if time_since_start > 1.0 * 1e9:  # Wait 1 second into startup
+                    self.send_imu_cmd('q')
+                    self.quaternion_enable_sent = True
+                    self.last_quaternion_enable_time_ns = now_ns
+                    self.get_logger().info("No quaternion data detected, sending enable command")
+            return
+        
+        # After startup grace period, monitor for missing quaternion data
+        if self.last_quaternion_time is None:
+            # Never received quaternion data, send enable command
+            if not self.quaternion_enable_sent or \
+               (now_ns - self.last_quaternion_enable_time_ns) > self.quaternion_enable_debounce_ns:
+                self.send_imu_cmd('q')
+                self.last_quaternion_enable_time_ns = now_ns
+                self.get_logger().warn("No quaternion data ever received, sending enable command")
+            return
+        
+        # Check if quaternion data has stopped
+        time_since_last_quat = (now - self.last_quaternion_time).nanoseconds
+        
+        if time_since_last_quat > self.quaternion_timeout_ns:
+            # Quaternion data has stopped, re-enable it (with debounce)
+            if (now_ns - self.last_quaternion_enable_time_ns) > self.quaternion_enable_debounce_ns:
+                self.send_imu_cmd('q')
+                self.last_quaternion_enable_time_ns = now_ns
+                self.get_logger().warn(
+                    f"Quaternion data timeout ({time_since_last_quat / 1e9:.1f}s), "
+                    f"re-enabling quaternion output"
+                )
 
 
 
